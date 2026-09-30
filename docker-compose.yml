@@ -1,0 +1,113 @@
+# Event dispatch stack.
+#
+# The destination allow-list is deployment-time configuration: target URLs and
+# per-target secrets are injected here as environment variables and can never
+# be supplied or widened by producers.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dispatch
+      POSTGRES_PASSWORD: dispatch
+      POSTGRES_DB: dispatch
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dispatch -d dispatch"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    build: .
+    command: uvicorn app.api:app --host 0.0.0.0 --port 8000
+    environment:
+      DATABASE_URL: postgresql://dispatch:dispatch@db:5432/dispatch
+      WEBHOOK_CLOCK_MODE: virtual
+      WEBHOOK_TARGETS: >-
+        target-a=http://target-a:8080/hook:secret-a,
+        target-b=http://target-b:8080/hook:secret-b
+      WEBHOOK_HTTP_TIMEOUT: "2"
+      WEBHOOK_RETRY_DELAYS: "1,2,4"
+      WEBHOOK_MAX_ATTEMPTS: "4"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+        "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  worker:
+    build: .
+    command: python -m app.worker
+    environment:
+      DATABASE_URL: postgresql://dispatch:dispatch@db:5432/dispatch
+      WEBHOOK_CLOCK_MODE: virtual
+      WEBHOOK_TARGETS: >-
+        target-a=http://target-a:8080/hook:secret-a,
+        target-b=http://target-b:8080/hook:secret-b
+      WEBHOOK_HTTP_TIMEOUT: "2"
+      WEBHOOK_RETRY_DELAYS: "1,2,4"
+      WEBHOOK_MAX_ATTEMPTS: "4"
+      WORKER_ADMIN_PORT: "8081"
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+      target-a:
+        condition: service_started
+      target-b:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+        "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8081/healthz').status==200 else 1)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  target-a:
+    build: .
+    command: python -m app.fake_target
+    environment:
+      TARGET_SECRET: secret-a
+      TARGET_PORT: "8080"
+
+  target-b:
+    build: .
+    command: python -m app.fake_target
+    environment:
+      TARGET_SECRET: secret-b
+      TARGET_PORT: "8080"
+
+  # One-shot acceptance suite: `docker compose run --rm verify`.
+  verify:
+    build: .
+    command: python -m app.verify
+    environment:
+      API_URL: http://api:8000
+      WORKER_ADMIN_URL: http://worker:8081
+      TARGET_A_URL: http://target-a:8080
+      TARGET_B_URL: http://target-b:8080
+      TARGET_A_SECRET: secret-a
+      TARGET_B_SECRET: secret-b
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+      target-a:
+        condition: service_started
+      target-b:
+        condition: service_started
+
+volumes:
+  db-data:
